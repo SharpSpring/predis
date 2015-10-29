@@ -17,6 +17,7 @@ use Predis\Command\CommandInterface;
 use Predis\Command\RawCommand;
 use Predis\Connection\FactoryInterface;
 use Predis\Connection\NodeConnectionInterface;
+use PRedis\Connection\ConnectionException;
 use Predis\NotSupportedException;
 use Predis\Response\ErrorInterface as ErrorResponseInterface;
 
@@ -83,8 +84,23 @@ class RedisCluster implements ClusterInterface, \IteratorAggregate, \Countable
      */
     public function connect()
     {
-        if ($connection = $this->getRandomConnection()) {
-            $connection->connect();
+        if (!$this->pool) {
+            return;
+        }
+
+        $connections = $this->pool;
+        shuffle($connections);
+        foreach ($connections as $connection) {
+            try {
+                $connection->connect();
+                $this->askSlotsMap($connection);
+                return;
+            } catch (ConnectionException $e) {
+                error_log($e->getMessage());
+            }
+        }
+        if (!empty($e)) {
+            throw $e;
         }
     }
 
