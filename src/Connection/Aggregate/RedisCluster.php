@@ -46,10 +46,12 @@ use Predis\Response\ErrorInterface as ErrorResponseInterface;
 class RedisCluster implements ClusterInterface, \IteratorAggregate, \Countable
 {
     private $useClusterSlots = true;
+    private $hasBuiltSlots = false;
+    private $hasFetchedSlots = false;
     private $defaultParameters = array();
-    private $pool = array();
+    public $pool = array();
     private $slots = array();
-    private $slotsMap;
+    private $slotsMap = array();
     private $strategy;
     private $connections;
 
@@ -88,6 +90,11 @@ class RedisCluster implements ClusterInterface, \IteratorAggregate, \Countable
             return;
         }
 
+        $connection = $this->getConnectedConnection();
+        if ($connection) {
+            return;
+        }
+
         $connections = $this->pool;
         shuffle($connections);
         foreach ($connections as $connection) {
@@ -97,6 +104,7 @@ class RedisCluster implements ClusterInterface, \IteratorAggregate, \Countable
                 return;
             } catch (ConnectionException $e) {
                 error_log($e->getMessage());
+                unset($this->pool[(string) $connection]);
             }
         }
         if (!empty($e)) {
@@ -120,7 +128,8 @@ class RedisCluster implements ClusterInterface, \IteratorAggregate, \Countable
     public function add(NodeConnectionInterface $connection)
     {
         $this->pool[(string) $connection] = $connection;
-        unset($this->slotsMap);
+        $this->slotsMap = array();
+        $this->hasFetchedSlots = false;
     }
 
     /**
@@ -129,10 +138,9 @@ class RedisCluster implements ClusterInterface, \IteratorAggregate, \Countable
     public function remove(NodeConnectionInterface $connection)
     {
         if (false !== $id = array_search($connection, $this->pool, true)) {
-            unset(
-                $this->pool[$id],
-                $this->slotsMap
-            );
+            unset($this->pool[$id]);
+            $this->slotsMap = array();
+            $this->hasFetchedSlots = false;
 
             return true;
         }
@@ -150,10 +158,9 @@ class RedisCluster implements ClusterInterface, \IteratorAggregate, \Countable
     public function removeById($connectionID)
     {
         if (isset($this->pool[$connectionID])) {
-            unset(
-                $this->pool[$connectionID],
-                $this->slotsMap
-            );
+            unset($this->pool[$connectionID]);
+            $this->slotsMap = array();
+            $this->hasFetchedSlots = false;
 
             return true;
         }
@@ -162,16 +169,15 @@ class RedisCluster implements ClusterInterface, \IteratorAggregate, \Countable
     }
 
     /**
-     * Generates the current slots map by guessing the cluster configuration out
-     * of the connection parameters of the connections in the pool.
-     *
-     * Generation is based on the same algorithm used by Redis to generate the
-     * cluster, so it is most effective when all of the connections supplied on
-     * initialization have the "slots" parameter properly set accordingly to the
-     * current cluster configuration.
+     * Generates the current slots map by using the cluster configuration from
+     * the connection parameters of the connections in the pool. The "slots"
+     * parameter on a connection can be set to a range of slots.
      */
     public function buildSlotsMap()
     {
+        if ($this->hasBuiltSlots) {
+            return;
+        }
         $this->slotsMap = array();
 
         foreach ($this->pool as $connectionID => $connection) {
@@ -184,6 +190,8 @@ class RedisCluster implements ClusterInterface, \IteratorAggregate, \Countable
             $slots = explode('-', $parameters->slots, 2);
             $this->setSlots($slots[0], $slots[1], $connectionID);
         }
+
+        $this->hasBuiltSlots = true;
     }
 
     /**
@@ -197,12 +205,19 @@ class RedisCluster implements ClusterInterface, \IteratorAggregate, \Countable
      */
     public function askSlotsMap(NodeConnectionInterface $connection = null)
     {
-        if (!$connection && !$connection = $this->getRandomConnection()) {
+        if (!$connection) {
+            $this->connect();
+            $connection = $this->getConnectedConnection();
+        }
+        if (!$connection) {
             return array();
         }
 
         $command = RawCommand::create('CLUSTER', 'SLOTS');
         $response = $connection->executeCommand($command);
+        if (empty($response)) {
+            return $this->slotsMap;
+        }
 
         foreach ($response as $slots) {
             // We only support master servers for now, so we ignore subsequent
@@ -216,6 +231,7 @@ class RedisCluster implements ClusterInterface, \IteratorAggregate, \Countable
             }
         }
 
+        $this->hasFetchedSlots = true;
         return $this->slotsMap;
     }
 
@@ -253,34 +269,21 @@ class RedisCluster implements ClusterInterface, \IteratorAggregate, \Countable
             );
         }
 
-        $slots = array_fill($first, $last - $first + 1, (string) $connection);
+        $connectionID = (string) $connection;
+        if ($connection instanceof NodeConnectionInterface &&
+            !isset($this->pool[$connectionID])
+        ) {
+            $this->pool[$connectionID] = $connection;
+        }
+
+        $slots = array_fill($first, $last - $first + 1, $connectionID);
         $this->slotsMap = $this->getSlotsMap() + $slots;
-    }
 
-    /**
-     * Guesses the correct node associated to a given slot using a precalculated
-     * slots map, falling back to the same logic used by Redis to initialize a
-     * cluster (best-effort).
-     *
-     * @param int $slot Slot index.
-     *
-     * @return string Connection ID.
-     */
-    protected function guessNode($slot)
-    {
-        if (!isset($this->slotsMap)) {
-            $this->buildSlotsMap();
+        if (isset($this->pool[$connectionID])) {
+            $connection = $this->pool[$connectionID];
+            $slots = array_fill($first, $last - $first + 1, $connection);
+            $this->slots = $this->slots + $slots;
         }
-
-        if (isset($this->slotsMap[$slot])) {
-            return $this->slotsMap[$slot];
-        }
-
-        $count = count($this->pool);
-        $index = min((int) ($slot / (int) (16384 / $count)), $count - 1);
-        $nodes = array_keys($this->pool);
-
-        return $nodes[$index];
     }
 
     /**
@@ -317,6 +320,7 @@ class RedisCluster implements ClusterInterface, \IteratorAggregate, \Countable
             );
         }
 
+
         if (isset($this->slots[$slot])) {
             return $this->slots[$slot];
         } else {
@@ -339,18 +343,32 @@ class RedisCluster implements ClusterInterface, \IteratorAggregate, \Countable
             throw new \OutOfBoundsException("Invalid slot [$slot].");
         }
 
+        if (empty($this->slotsMap)) {
+            $this->buildSlotsMap();
+        }
+
         if (isset($this->slots[$slot])) {
             return $this->slots[$slot];
         }
 
-        $connectionID = $this->guessNode($slot);
-
-        if (!$connection = $this->getConnectionById($connectionID)) {
-            $connection = $this->createConnection($connectionID);
-            $this->pool[$connectionID] = $connection;
+        if (!$this->hasFetchedSlots) {
+            $this->askSlotsMap();
         }
 
-        return $this->slots[$slot] = $connection;
+        if (isset($this->slotsMap[$slot])) {
+            $connectionID = $this->slotsMap[$slot];
+            return $this->pool[$connectionID];
+        }
+
+        $count = count($this->pool);
+        $index = min((int) ($slot / (int) (16384 / $count)), $count - 1);
+        $nodes = array_keys($this->pool);
+
+        if (isset($nodes[$index])) {
+            return $this->pool[$nodes[$index]];
+        }
+
+        return $this->getRandomConnection();
     }
 
     /**
@@ -372,6 +390,20 @@ class RedisCluster implements ClusterInterface, \IteratorAggregate, \Countable
     {
         if ($this->pool) {
             return $this->pool[array_rand($this->pool)];
+        }
+    }
+
+    /**
+     * Returns an actively connected connection from the pool.
+     *
+     * @return NodeConnectionInterface|null
+     */
+    protected function getConnectedConnection()
+    {
+        foreach ($this->pool as $connection) {
+            if ($connection->isConnected()) {
+                return $connection;
+            }
         }
     }
 
